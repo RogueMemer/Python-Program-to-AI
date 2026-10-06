@@ -13,7 +13,7 @@ def leading_digit_frequency(values: Iterable[object]) -> dict[int, int]:
     """Count the first non-zero decimal digit for each usable value.
 
     >>> leading_digit_frequency([-120, 0.0042, 3, None])
-    {1: 1, 2: 1, 3: 1, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0}
+    {1: 1, 2: 0, 3: 1, 4: 1, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0}
     """
     frequencies = {digit: 0 for digit in range(1, 10)}
     for value in values:

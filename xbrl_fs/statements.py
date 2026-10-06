@@ -34,7 +34,7 @@ def _normalize_cik(value: object) -> str:
 def select_latest_filing(submissions: pd.DataFrame, cik: int | str) -> pd.Series:
     """Select the latest 10-K or 10-Q row for a CIK, ordered by filing date.
 
-    >>> filings = pd.DataFrame({"cik": [1, 1], "form": ["10-K", "10-Q"], "filed": ["2024-02-01", "2024-05-01"]})
+    >>> filings = pd.DataFrame({"cik": [1, 1], "form": ["10-K", "10-Q"], "filed": ["2024-02-01", "2024-05-01"], "adsh": ["a", "b"]})
     >>> select_latest_filing(filings, "0000000001")["form"]
     '10-Q'
     """
@@ -89,12 +89,15 @@ def create_financial_statements(
     numeric: pd.DataFrame,
     tags: pd.DataFrame,
     cik: int | str,
+    presentation: pd.DataFrame | None = None,
 ) -> tuple[pd.Series, dict[str, pd.DataFrame]]:
-    """Build flattened primary statements from the latest filing for a CIK.
+    """Build primary statements from the latest filing for a CIK.
 
     Facts are restricted to the selected accession and consolidated (non-segment)
-    rows. Duration facts retain SEC's quarter count so quarterly and year-to-date
-    values remain distinguishable. Returns the filing metadata and three tables.
+    rows. When PRE is provided, statement assignment, preferred labels, line order,
+    and negating flags come from the SEC presentation table. Duration facts retain
+    SEC's quarter count so quarterly and year-to-date values remain distinguishable.
+    Returns the filing metadata and three tables.
 
     >>> subs = pd.DataFrame({"cik": [7], "form": ["10-Q"], "filed": ["2024-05-01"], "adsh": ["a"], "period": ["2024-03-31"]})
     >>> nums = pd.DataFrame({"adsh": ["a", "a"], "tag": ["Assets", "Revenues"], "version": ["us-gaap/2024", "us-gaap/2024"], "ddate": ["2024-03-31", "2024-03-31"], "qtrs": [0, 1], "uom": ["USD", "USD"], "value": [100, 50], "segments": ["", ""]})
@@ -136,11 +139,64 @@ def create_financial_statements(
     ]
 
     display_columns = ["label", "tag", "period", "quarters", "uom", "value"]
+    if presentation is not None:
+        presentation = _normalize_columns(presentation)
+        required_presentation = {"adsh", "tag", "version", "stmt", "report", "line", "plabel"}
+        missing_presentation = required_presentation.difference(presentation.columns)
+        if missing_presentation:
+            raise ValueError(
+                f"PRE table is missing required columns: {sorted(missing_presentation)}"
+            )
+        join_columns = ["adsh", "tag"]
+        if "version" in facts.columns:
+            join_columns.append("version")
+        if "version" not in join_columns:
+            raise ValueError("NUM table must include version to match PRE presentation rows")
+        presentation_columns = join_columns + ["stmt", "report", "line", "plabel"]
+        if "negating" in presentation.columns:
+            presentation_columns.append("negating")
+        presented = presentation.loc[
+            presentation["adsh"].eq(filing["adsh"]), presentation_columns
+        ].copy()
+        facts = facts.merge(
+            presented.drop_duplicates(join_columns + ["report", "line"]),
+            on=join_columns,
+            how="inner",
+            validate="many_to_many",
+        )
+        facts["label"] = facts["plabel"].fillna(facts["label"])
+        facts["statement"] = facts["stmt"].map(
+            {"BS": "balance_sheet", "IS": "income_statement", "CF": "cash_flow"}
+        )
+        if "negating" in facts.columns:
+            negating = facts["negating"].astype(str).str.strip().isin(["1", "True", "true"])
+            facts.loc[negating, "value"] *= -1
+        display_columns += ["stmt", "report", "line"]
+    else:
+        facts["statement"] = [
+            _statement_for_fact(tag, label, quarters)
+            for tag, label, quarters in zip(facts["tag"], facts["label"], facts["quarters"])
+        ]
+
     tables: dict[str, pd.DataFrame] = {}
     for name in STATEMENT_NAMES:
         table = facts.loc[facts["statement"].eq(name), display_columns].copy()
-        table = table.drop_duplicates(["tag", "period", "quarters", "uom"], keep="last")
-        tables[name] = table.sort_values(["period", "quarters", "label"], ascending=[False, False, True]).reset_index(drop=True)
+        if presentation is not None:
+            table = table.drop_duplicates(
+                ["report", "line", "tag", "period", "quarters", "uom"], keep="last"
+            )
+            table["_report_order"] = pd.to_numeric(table["report"], errors="coerce")
+            table["_line_order"] = pd.to_numeric(table["line"], errors="coerce")
+            sort_columns = ["_report_order", "_line_order", "period", "quarters"]
+            ascending = [True, True, False, False]
+        else:
+            table = table.drop_duplicates(["tag", "period", "quarters", "uom"], keep="last")
+            sort_columns = ["period", "quarters", "label"]
+            ascending = [False, False, True]
+        table = table.sort_values(sort_columns, ascending=ascending)
+        if presentation is not None:
+            table = table.drop(columns=["_report_order", "_line_order"])
+        tables[name] = table.reset_index(drop=True)
     return filing, tables
 
 
@@ -160,7 +216,7 @@ def common_size_statements(
     ... }
     >>> common_size_statements(statements)["balance_sheet"]["value"].tolist()
     [100.0, 25.0]
-    >>> common_size_statements(statements)["cash_flow"]["value"].iloc[0]
+    >>> float(common_size_statements(statements)["cash_flow"]["value"].iloc[0])
     20.0
     """
     result: dict[str, pd.DataFrame] = {}
